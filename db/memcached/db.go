@@ -32,6 +32,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/magiconair/properties"
@@ -83,8 +84,10 @@ func (db *mcDB) InitThread(ctx context.Context, _ int, _ int) context.Context {
 func (db *mcDB) CleanupThread(_ context.Context) {}
 
 func (db *mcDB) Read(ctx context.Context, table string, key string, fields []string) (map[string][]byte, error) {
-	item, err := db.client.Get(key)
-	if err != nil {
+	item, err := db.client.Get(getRowKey(table, key))
+	if errors.Is(err, memcache.ErrCacheMiss) {
+		return nil, nil
+	} else if err != nil {
 		return nil, err
 	}
 	var r map[string][]byte
@@ -100,12 +103,24 @@ func (db *mcDB) Scan(ctx context.Context, table string, startKey string, count i
 }
 
 func (db *mcDB) Update(ctx context.Context, table string, key string, values map[string][]byte) error {
-	data, err := json.Marshal(values)
+	item, err := db.client.Get(getRowKey(table, key))
+	if errors.Is(err, memcache.ErrCacheMiss) {
+		return db.Insert(ctx, table, key, values)
+	}
+
+	var m map[string][]byte
+	err = json.NewDecoder(bytes.NewReader(item.Value)).Decode(&m)
+	for field, value := range values {
+		m[field] = value
+	}
+
+	data, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
-	item := &memcache.Item{
-		Key:   key,
+
+	item = &memcache.Item{
+		Key:   getRowKey(table, key),
 		Value: data,
 	}
 	err = db.client.Set(item)
@@ -116,9 +131,25 @@ func (db *mcDB) Update(ctx context.Context, table string, key string, values map
 }
 
 func (db *mcDB) Insert(ctx context.Context, table string, key string, values map[string][]byte) error {
-	return db.Update(ctx, table, key, values)
+	data, err := json.Marshal(values)
+	if err != nil {
+		return err
+	}
+	item := &memcache.Item{
+		Key:   getRowKey(table, key),
+		Value: data,
+	}
+	err = db.client.Add(item)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (db *mcDB) Delete(ctx context.Context, table string, key string) error {
-	return db.client.Delete(key)
+	return db.client.Delete(getRowKey(table, key))
+}
+
+func getRowKey(table, key string) string {
+	return fmt.Sprintf("%s:%s", table, key)
 }
